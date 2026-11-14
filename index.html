@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#111">
+<title>Laufband</title>
+<style>
+  :root { --bg:#111; --card:#1d1d1f; --fg:#f5f5f7; --dim:#8e8e93; --acc:#30d158; --warn:#ff9f0a; --bad:#ff453a; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { margin:0; background:var(--bg); color:var(--fg); font-family:-apple-system,system-ui,Roboto,sans-serif; }
+  body { padding:12px; padding-top:max(12px, env(safe-area-inset-top)); max-width:720px; margin:0 auto; }
+  header { display:flex; justify-content:space-between; align-items:center; gap:8px; margin-bottom:10px; }
+  #status { font-size:14px; color:var(--dim); }
+  #status.ok { color:var(--acc); }
+  button { font:inherit; border:0; border-radius:14px; color:var(--fg); background:#2c2c2e; padding:14px; cursor:pointer; user-select:none; }
+  button:active { filter:brightness(1.3); }
+  button:disabled { opacity:.35; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  .card { background:var(--card); border-radius:16px; padding:12px; text-align:center; }
+  .val { font-size:44px; font-weight:700; font-variant-numeric:tabular-nums; line-height:1.1; }
+  .lbl { font-size:13px; color:var(--dim); margin-top:2px; }
+  .big { grid-column:span 2; }
+  .big .val { font-size:64px; }
+  .ctrl { display:grid; grid-template-columns:repeat(4,1fr); gap:8px; margin-top:8px; }
+  .ctrl button { font-size:22px; font-weight:600; padding:18px 0; }
+  .main { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-top:8px; }
+  .main button { font-size:22px; font-weight:700; padding:28px 0; }
+  #start { background:var(--acc); color:#000; }
+  #pause { background:var(--warn); color:#000; }
+  #stop { background:var(--bad); }
+  #stop.armed { outline:3px solid #fff; }
+  .main button.active { outline:3px solid #fff; }
+  .row { display:flex; gap:8px; margin-top:8px; }
+  .row button { flex:1; font-size:15px; }
+  #log { font-size:12px; color:var(--dim); margin-top:8px; min-height:16px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; margin-top:8px; }
+  td,th { padding:6px 4px; border-bottom:1px solid #2c2c2e; text-align:right; }
+  td:first-child,th:first-child { text-align:left; }
+  details { margin-top:12px; }
+  summary { color:var(--dim); cursor:pointer; }
+</style>
+</head>
+<body>
+<header>
+  <div id="status">Nicht verbunden</div>
+  <button id="connect">Verbinden</button>
+</header>
+
+<div class="grid">
+  <div class="card big"><div class="val" id="speed">0.0</div><div class="lbl">km/h</div></div>
+  <div class="card"><div class="val" id="time">0:00</div><div class="lbl">Zeit</div></div>
+  <div class="card"><div class="val" id="dist">0.00</div><div class="lbl">km</div></div>
+  <div class="card"><div class="val" id="kcal">0</div><div class="lbl">kcal</div></div>
+  <div class="card"><div class="val" id="incl">0.0</div><div class="lbl">Steigung %</div></div>
+  <div class="card"><div class="val" id="hr">-</div><div class="lbl">Puls</div></div>
+  <div class="card"><div class="val" id="avg">0.0</div><div class="lbl">Ø km/h</div></div>
+</div>
+
+<div class="ctrl">
+  <button id="spdDown" disabled>− km/h</button>
+  <button id="spdUp" disabled>+ km/h</button>
+  <button id="incDown" disabled>− %</button>
+  <button id="incUp" disabled>+ %</button>
+</div>
+<div class="main">
+  <button id="start" disabled>START</button>
+  <button id="pause" disabled>PAUSE</button>
+  <button id="stop" disabled>STOP</button>
+</div>
+<div id="log"></div>
+
+<details>
+  <summary>Gespeicherte Einheiten</summary>
+  <table><thead><tr><th>Datum</th><th>Zeit</th><th>km</th><th>kcal</th></tr></thead><tbody id="hist"></tbody></table>
+  <div class="row">
+    <button id="save">Einheit jetzt speichern</button>
+    <button id="csv">CSV exportieren</button>
+    <button id="clear">Liste löschen</button>
+  </div>
+</details>
+
+<script>
+const FTMS = 0x1826, C_DATA = 0x2acd, C_CP = 0x2ad9, C_STATUS = 0x2ada, C_SPD = 0x2ad4, C_INC = 0x2ad5;
+const $ = id => document.getElementById(id);
+let dev, cp, cpReady = false, paused = false, wakeLock = null;
+let cur = { speed:0, dist:0, incl:0, kcal:0, hr:0, time:0 };
+let range = { sMin:0.5, sMax:16, sStep:0.1, iMin:0, iMax:15, iStep:1 };
+let stopArmed = null;
+
+const log = t => { $('log').textContent = t; };
+const fmtTime = s => { const h = Math.floor(s/3600), m = Math.floor(s%3600/60), x = s%60;
+  return h ? `${h}:${String(m).padStart(2,'0')}:${String(x).padStart(2,'0')}` : `${m}:${String(x).padStart(2,'0')}`; };
+
+function render() {
+  $('speed').textContent = cur.speed.toFixed(1);
+  $('dist').textContent = (cur.dist/1000).toFixed(2);
+  $('incl').textContent = cur.incl.toFixed(1);
+  $('kcal').textContent = cur.kcal;
+  $('hr').textContent = cur.hr || '-';
+  $('time').textContent = fmtTime(cur.time);
+  $('avg').textContent = cur.time ? (cur.dist/1000/(cur.time/3600)).toFixed(1) : '0.0';
+}
+
+// FTMS Treadmill Data (0x2ACD) parsen
+function parseTreadmill(dv) {
+  const f = dv.getUint16(0, true); let o = 2;
+  if (!(f & 0x0001)) { cur.speed = dv.getUint16(o, true)/100; o += 2; }
+  if (f & 0x0002) o += 2;                                   // Ø Geschwindigkeit
+  if (f & 0x0004) { cur.dist = dv.getUint16(o, true) | (dv.getUint8(o+2) << 16); o += 3; }
+  if (f & 0x0008) { cur.incl = dv.getInt16(o, true)/10; o += 4; } // Steigung + Rampenwinkel
+  if (f & 0x0010) o += 4;                                   // Höhenmeter +/-
+  if (f & 0x0020) o += 1;                                   // Pace
+  if (f & 0x0040) o += 1;                                   // Ø Pace
+  if (f & 0x0080) { const k = dv.getUint16(o, true); if (k !== 0xffff) cur.kcal = k; o += 5; }
+  if (f & 0x0100) { cur.hr = dv.getUint8(o); o += 1; }
+  if (f & 0x0200) o += 1;                                   // MET
+  if (f & 0x0400) { cur.time = dv.getUint16(o, true); o += 2; }
+  render();
+}
+
+const OPS = { 0x00:'Steuerung', 0x02:'Geschwindigkeit', 0x03:'Steigung', 0x07:'Start', 0x08:'Stop/Pause' };
+const RES = { 1:'OK', 2:'nicht unterstützt', 3:'ungültiger Wert', 4:'fehlgeschlagen', 5:'keine Steuerung' };
+
+function onCpResponse(dv) {
+  if (dv.getUint8(0) !== 0x80) return;
+  const op = dv.getUint8(1), r = dv.getUint8(2);
+  log(`${OPS[op] || 'Befehl 0x'+op.toString(16)}: ${RES[r] || r}`);
+  if (op === 0x00 && r === 1) { cpReady = true; setButtons(true); }
+}
+
+async function send(bytes) {
+  if (!cp) return;
+  try { await cp.writeValueWithResponse(new Uint8Array(bytes)); }
+  catch (e) { log('Senden fehlgeschlagen: ' + e.message); }
+}
+
+async function readRanges(svc) {
+  try {
+    const s = await (await svc.getCharacteristic(C_SPD)).readValue();
+    range.sMin = s.getUint16(0,true)/100; range.sMax = s.getUint16(2,true)/100; range.sStep = Math.max(s.getUint16(4,true)/100, 0.1);
+  } catch {}
+  try {
+    const i = await (await svc.getCharacteristic(C_INC)).readValue();
+    range.iMin = i.getInt16(0,true)/10; range.iMax = i.getInt16(2,true)/10; range.iStep = Math.max(i.getUint16(4,true)/10, 0.5);
+  } catch {}
+}
+
+async function connect() {
+  if (!navigator.bluetooth) { log('Dieser Browser kann kein Web Bluetooth. Chrome (Android/Mac) oder Bluefy (iPhone) nutzen.'); return; }
+  try {
+    dev = await navigator.bluetooth.requestDevice({ filters:[{ services:[FTMS] }] });
+    dev.addEventListener('gattserverdisconnected', onDisconnect);
+    $('status').textContent = 'Verbinde...';
+    const gatt = await dev.gatt.connect();
+    const svc = await gatt.getPrimaryService(FTMS);
+    await readRanges(svc);
+    const data = await svc.getCharacteristic(C_DATA);
+    data.addEventListener('characteristicvaluechanged', e => parseTreadmill(e.target.value));
+    await data.startNotifications();
+    try {
+      const st = await svc.getCharacteristic(C_STATUS);
+      st.addEventListener('characteristicvaluechanged', e => {
+        const c = e.target.value.getUint8(0);
+        if (c === 0x02) setPaused(e.target.value.byteLength > 1 && e.target.value.getUint8(1) === 0x02);
+        if (c === 0x04) setPaused(false);
+      });
+      await st.startNotifications();
+    } catch {}
+    cp = await svc.getCharacteristic(C_CP);
+    cp.addEventListener('characteristicvaluechanged', e => onCpResponse(e.target.value));
+    await cp.startNotifications();
+    await send([0x00]); // Steuerung anfordern
+    $('status').textContent = dev.name || 'Verbunden'; $('status').className = 'ok';
+    $('connect').textContent = 'Trennen';
+    requestWake();
+  } catch (e) { log('Verbindung fehlgeschlagen: ' + e.message); $('status').textContent = 'Nicht verbunden'; }
+}
+
+function onDisconnect() {
+  cp = null; cpReady = false; setButtons(false);
+  $('status').textContent = 'Getrennt'; $('status').className = '';
+  $('connect').textContent = 'Verbinden';
+}
+
+function setButtons(on) { ['spdDown','spdUp','incDown','incUp','start','pause','stop'].forEach(id => $(id).disabled = !on); }
+function setPaused(p) { paused = p; $('pause').classList.toggle('active', p); }
+
+function setSpeed(v) {
+  v = Math.min(range.sMax, Math.max(range.sMin, Math.round(v*10)/10));
+  const n = Math.round(v*100); send([0x02, n & 0xff, n >> 8]);
+}
+function setIncl(v) {
+  v = Math.min(range.iMax, Math.max(range.iMin, v));
+  const n = Math.round(v*10) & 0xffff; send([0x03, n & 0xff, n >> 8]);
+}
+
+$('connect').onclick = () => (dev && dev.gatt.connected) ? dev.gatt.disconnect() : connect();
+$('spdUp').onclick   = () => setSpeed(cur.speed + range.sStep);
+$('spdDown').onclick = () => setSpeed(cur.speed - range.sStep);
+$('incUp').onclick   = () => setIncl(cur.incl + range.iStep);
+$('incDown').onclick = () => setIncl(cur.incl - range.iStep);
+$('start').onclick   = () => { send([0x07]); setPaused(false); };            // Start oder Fortsetzen
+$('pause').onclick   = () => { send([0x08, 0x02]); setPaused(true); };
+$('stop').onclick    = () => {           // zweimal tippen innerhalb von 2 s
+  if (stopArmed) { clearTimeout(stopArmed); stopArmed = null; $('stop').classList.remove('armed');
+    saveSession(); send([0x08, 0x01]); setPaused(false); return; }
+  $('stop').classList.add('armed'); log('Zum Beenden nochmal STOP tippen');
+  stopArmed = setTimeout(() => { stopArmed = null; $('stop').classList.remove('armed'); log(''); }, 2000);
+};
+
+// Bildschirm anlassen
+async function requestWake() { try { wakeLock = await navigator.wakeLock.request('screen'); } catch {} }
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && dev?.gatt.connected) requestWake(); });
+
+// Einheiten lokal speichern (nur auf diesem Gerät)
+const KEY = 'laufband_sessions';
+const load = () => { try { return JSON.parse(localStorage.getItem(KEY)) || []; } catch { return []; } };
+const store = a => { try { localStorage.setItem(KEY, JSON.stringify(a)); } catch {} };
+function saveSession() {
+  if (!cur.time) return;
+  const a = load(); a.unshift({ d:new Date().toISOString(), t:cur.time, m:cur.dist, k:cur.kcal }); store(a); renderHist();
+  log('Einheit gespeichert');
+}
+function renderHist() {
+  $('hist').innerHTML = load().map(s => `<tr><td>${new Date(s.d).toLocaleString('de-DE',{dateStyle:'short',timeStyle:'short'})}</td><td>${fmtTime(s.t)}</td><td>${(s.m/1000).toFixed(2)}</td><td>${s.k}</td></tr>`).join('');
+}
+$('save').onclick = saveSession;
+$('clear').onclick = () => { if ($('clear').dataset.armed) { store([]); renderHist(); delete $('clear').dataset.armed; $('clear').textContent='Liste löschen'; }
+  else { $('clear').dataset.armed = 1; $('clear').textContent = 'Wirklich löschen?'; } };
+$('csv').onclick = () => {
+  const rows = ['datum;dauer_s;distanz_m;kcal', ...load().map(s => `${s.d};${s.t};${s.m};${s.k}`)].join('\n');
+  const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([rows], { type:'text/csv' }));
+  a.download = 'laufband.csv'; a.click();
+};
+renderHist(); render();
+</script>
+</body>
+</html>

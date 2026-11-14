@@ -33,7 +33,8 @@
   .main button.active { outline:3px solid #fff; }
   .row { display:flex; gap:8px; margin-top:8px; }
   .row button { flex:1; font-size:15px; }
-  #log { font-size:12px; color:var(--dim); margin-top:8px; min-height:16px; }
+  #log { font-size:15px; color:var(--warn); margin:0 0 10px; min-height:20px; text-align:center; }
+  body { padding-bottom:120px; }
   table { width:100%; border-collapse:collapse; font-size:13px; margin-top:8px; }
   td,th { padding:6px 4px; border-bottom:1px solid #2c2c2e; text-align:right; }
   td:first-child,th:first-child { text-align:left; }
@@ -46,6 +47,7 @@
   <div id="status">Nicht verbunden</div>
   <button id="connect">Verbinden</button>
 </header>
+<div id="log"></div>
 
 <div class="grid">
   <div class="card big"><div class="val" id="speed">0.0</div><div class="lbl">km/h</div></div>
@@ -68,7 +70,6 @@
   <button id="pause" disabled>PAUSE</button>
   <button id="stop" disabled>STOP</button>
 </div>
-<div id="log"></div>
 
 <details>
   <summary>Gespeicherte Einheiten</summary>
@@ -86,7 +87,7 @@ const $ = id => document.getElementById(id);
 let dev, cp, cpReady = false, paused = false, wakeLock = null;
 let cur = { speed:0, dist:0, incl:0, kcal:0, hr:0, time:0 };
 let range = { sMin:0.5, sMax:16, sStep:0.1, iMin:0, iMax:15, iStep:1 };
-let stopArmed = null;
+let stopArmed = null, lastSpeed = 0;
 
 const log = t => { $('log').textContent = t; };
 const fmtTime = s => { const h = Math.floor(s/3600), m = Math.floor(s%3600/60), x = s%60;
@@ -200,8 +201,15 @@ $('spdUp').onclick   = () => setSpeed(cur.speed + range.sStep);
 $('spdDown').onclick = () => setSpeed(cur.speed - range.sStep);
 $('incUp').onclick   = () => setIncl(cur.incl + range.iStep);
 $('incDown').onclick = () => setIncl(cur.incl - range.iStep);
-$('start').onclick   = () => { send([0x07]); setPaused(false); };            // Start oder Fortsetzen
-$('pause').onclick   = () => { send([0x08, 0x02]); setPaused(true); };
+// Start/Fortsetzen: Steuerung neu anfordern, starten, danach letzte Geschwindigkeit setzen
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+$('start').onclick = async () => {
+  await send([0x00]); await sleep(300);
+  await send([0x07]); setPaused(false);
+  await sleep(2500);
+  if (cur.speed < 0.1 && lastSpeed > 0) { log(`Setze ${lastSpeed.toFixed(1)} km/h`); setSpeed(lastSpeed); }
+};
+$('pause').onclick = () => { if (cur.speed > 0) lastSpeed = cur.speed; send([0x08, 0x02]); setPaused(true); };
 $('stop').onclick    = () => {           // zweimal tippen innerhalb von 2 s
   if (stopArmed) { clearTimeout(stopArmed); stopArmed = null; $('stop').classList.remove('armed');
     saveSession(); send([0x08, 0x01]); setPaused(false); return; }
